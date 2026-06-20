@@ -718,7 +718,70 @@ class MaturityToggleTests(unittest.TestCase):
 
 
 class MaturityGuidesTests(unittest.TestCase):
-    def test_refresh_visibility_adds_maturity_legend_and_strike_end_labels(self) -> None:
+    def test_refresh_visibility_adds_historical_style_legend_and_strike_end_labels(self) -> None:
+        fake_fig = MagicMock()
+        fake_ax = MagicMock()
+        fake_ax.legend_ = None
+        annotation_one = MagicMock()
+        annotation_two = MagicMock()
+        fake_ax.annotate.side_effect = [annotation_one, annotation_two]
+        overlay = module.UnderlyingOverlay(ax=MagicMock(), line=MagicMock())
+        plotted_series = [
+            module.PlotSeries(
+                module.Line2D(
+                    pd.to_datetime(["2024-03-01", "2024-03-02"]),
+                    [1.0, 1.1],
+                    color="C0",
+                ),
+                pd.DataFrame(),
+                "2024-03-15",
+                100.0,
+            ),
+            module.PlotSeries(
+                module.Line2D(
+                    pd.to_datetime(["2024-03-01", "2024-03-02"]),
+                    [2.0, 2.1],
+                    color="C1",
+                ),
+                pd.DataFrame(),
+                "2024-06-21",
+                105.0,
+            ),
+        ]
+        visibility = module.PlotVisibility(
+            visible_maturities={"2024-03-15", "2024-06-21"}
+        )
+
+        module._refresh_visibility(
+            fake_fig,
+            fake_ax,
+            plotted_series,
+            visibility,
+            overlay,
+        )
+
+        fake_ax.set_xmargin.assert_called_once_with(module.END_LABEL_X_MARGIN)
+        handles = fake_ax.legend.call_args.kwargs["handles"]
+        self.assertEqual([handle.get_label() for handle in handles], ["underlying price"])
+        self.assertEqual([handle.get_color() for handle in handles], ["0.25"])
+        self.assertEqual([handle.get_linestyle() for handle in handles], ["-"])
+        self.assertNotIn("title", fake_ax.legend.call_args.kwargs)
+        self.assertEqual(fake_ax.annotate.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in fake_ax.annotate.call_args_list],
+            ["100", "105"],
+        )
+        self.assertEqual(
+            [call.kwargs["color"] for call in fake_ax.annotate.call_args_list],
+            ["C0", "C1"],
+        )
+        self.assertEqual(
+            fake_fig._strike_end_labels,
+            [annotation_one, annotation_two],
+        )
+        fake_fig.canvas.draw_idle.assert_called_once_with()
+
+    def test_refresh_visibility_skips_historical_legend_without_overlay(self) -> None:
         fake_fig = MagicMock()
         fake_ax = MagicMock()
         fake_ax.legend_ = None
@@ -753,31 +816,124 @@ class MaturityGuidesTests(unittest.TestCase):
 
         module._refresh_visibility(fake_fig, fake_ax, plotted_series, visibility)
 
-        fake_ax.set_xmargin.assert_called_once_with(module.END_LABEL_X_MARGIN)
+        fake_ax.legend.assert_not_called()
+        self.assertEqual(fake_ax.annotate.call_count, 2)
+
+    def test_refresh_visibility_adds_latest_style_legend(self) -> None:
+        fake_fig = MagicMock()
+        fake_ax = MagicMock()
+        fake_ax.legend_ = None
+        main_line = MagicMock()
+        main_line.get_visible.return_value = True
+        overlay_line = MagicMock()
+        overlay_line.get_visible.return_value = True
+        plotted_series = [
+            module.PlotSeries(
+                main_line,
+                pd.DataFrame(),
+                "2024-03-15",
+                100.0,
+                x_field="strikePrice",
+            )
+        ]
+        secondary_overlay = module.SecondaryFieldOverlay(
+            ax=MagicMock(),
+            plotted_series=[
+                module.PlotSeries(
+                    overlay_line,
+                    pd.DataFrame(),
+                    "2024-03-15",
+                    100.0,
+                    x_field="strikePrice",
+                )
+            ],
+            field="loss",
+        )
+        visibility = module.PlotVisibility(
+            visible_maturities={"2024-03-15"},
+            mode=module.LATEST_PLOT_MODE,
+        )
+
+        module._refresh_visibility(
+            fake_fig,
+            fake_ax,
+            plotted_series,
+            visibility,
+            secondary_overlay=secondary_overlay,
+            main_field="mid",
+        )
+
         handles = fake_ax.legend.call_args.kwargs["handles"]
         self.assertEqual(
             [handle.get_label() for handle in handles],
-            ["2024-03-15", "2024-06-21"],
+            ["mid price", "loss %"],
         )
-        self.assertEqual(
-            [handle.get_color() for handle in handles],
-            ["C0", "C1"],
+        self.assertEqual([handle.get_linestyle() for handle in handles], ["-", "--"])
+        fake_ax.annotate.assert_not_called()
+
+    def test_refresh_visibility_reuses_style_legend_while_slider_changes(self) -> None:
+        fake_fig = MagicMock()
+        fake_ax = MagicMock()
+        fake_ax.legend_ = None
+        created_legend = MagicMock()
+
+        def add_legend(*args: object, **kwargs: object) -> MagicMock:
+            fake_ax.legend_ = created_legend
+            return created_legend
+
+        fake_ax.legend.side_effect = add_legend
+        main_line = MagicMock()
+        main_line.get_visible.return_value = True
+        overlay_line = MagicMock()
+        overlay_line.get_visible.return_value = True
+        plotted_series = [
+            module.PlotSeries(
+                main_line,
+                pd.DataFrame(),
+                "2024-03-15",
+                100.0,
+                x_field="strikePrice",
+            )
+        ]
+        secondary_overlay = module.SecondaryFieldOverlay(
+            ax=MagicMock(),
+            plotted_series=[
+                module.PlotSeries(
+                    overlay_line,
+                    pd.DataFrame(),
+                    "2024-03-15",
+                    100.0,
+                    x_field="strikePrice",
+                )
+            ],
+            field="loss",
         )
-        self.assertEqual(fake_ax.legend.call_args.kwargs["title"], "Maturity")
-        self.assertEqual(fake_ax.annotate.call_count, 2)
-        self.assertEqual(
-            [call.args[0] for call in fake_ax.annotate.call_args_list],
-            ["100", "105"],
+        visibility = module.PlotVisibility(
+            visible_maturities={"2024-03-15"},
+            strike_bounds=(90.0, 100.0),
+            mode=module.LATEST_PLOT_MODE,
         )
-        self.assertEqual(
-            [call.kwargs["color"] for call in fake_ax.annotate.call_args_list],
-            ["C0", "C1"],
+
+        module._refresh_visibility(
+            fake_fig,
+            fake_ax,
+            plotted_series,
+            visibility,
+            secondary_overlay=secondary_overlay,
+            main_field="mid",
         )
-        self.assertEqual(
-            fake_fig._strike_end_labels,
-            [annotation_one, annotation_two],
+        visibility.strike_bounds = (95.0, 100.0)
+        module._refresh_visibility(
+            fake_fig,
+            fake_ax,
+            plotted_series,
+            visibility,
+            secondary_overlay=secondary_overlay,
+            main_field="mid",
         )
-        fake_fig.canvas.draw_idle.assert_called_once_with()
+
+        fake_ax.legend.assert_called_once()
+        created_legend.remove.assert_not_called()
 
 
 class UnderlyingOverlayTests(unittest.TestCase):

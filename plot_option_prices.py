@@ -953,29 +953,73 @@ def _clear_strike_end_labels(fig: Figure) -> None:
     _remember_control(fig, "_strike_end_labels", [])
 
 
-def _sync_maturity_legend(ax: Axes, plotted_series: list[PlotSeries]) -> None:
+def _clear_plot_legend(ax: Axes) -> None:
     legend = cast(Any, ax).__dict__.get("legend_", None)
     if legend is not None:
         legend.remove()
+    setattr(ax, "_style_legend_signature", None)
 
-    visible_maturities = _visible_maturities(plotted_series)
-    if not visible_maturities:
+
+def _style_legend_entries(
+    mode: str,
+    main_field: str | None,
+    underlying_overlay: UnderlyingOverlay | None,
+    secondary_overlay: SecondaryFieldOverlay | None,
+) -> tuple[tuple[str, str, str, float], ...]:
+    if mode == LATEST_PLOT_MODE:
+        entries: list[tuple[str, str, str, float]] = []
+        if main_field is not None:
+            entries.append((_field_ylabel(main_field), "-", "0.2", 2.0))
+        if secondary_overlay is not None:
+            entries.append(
+                (_field_ylabel(secondary_overlay.field), "--", "0.2", 2.0)
+            )
+        return tuple(entries)
+
+    if underlying_overlay is None:
+        return ()
+
+    return (("underlying price", "-", "0.25", 2.5),)
+
+
+def _sync_maturity_legend(
+    ax: Axes,
+    *,
+    mode: str = HISTORICAL_PLOT_MODE,
+    main_field: str | None = None,
+    underlying_overlay: UnderlyingOverlay | None = None,
+    secondary_overlay: SecondaryFieldOverlay | None = None,
+) -> None:
+    signature = _style_legend_entries(
+        mode,
+        main_field,
+        underlying_overlay,
+        secondary_overlay,
+    )
+    legend = cast(Any, ax).__dict__.get("legend_", None)
+    previous_signature = cast(Any, ax).__dict__.get("_style_legend_signature")
+    if not signature:
+        _clear_plot_legend(ax)
+        return
+    if signature == previous_signature and legend is not None:
         return
 
-    colors = _maturity_colors(plotted_series)
+    if legend is not None:
+        legend.remove()
+
     handles = [
         Line2D(
             [],
             [],
-            color=colors[maturity],
-            linestyle="-",
-            marker="o",
-            markersize=3,
-            label=maturity,
+            color=color,
+            linestyle=linestyle,
+            linewidth=linewidth,
+            label=label,
         )
-        for maturity in visible_maturities
+        for label, linestyle, color, linewidth in signature
     ]
-    ax.legend(handles=handles, title="Maturity", loc="upper left")
+    ax.legend(handles=handles, loc="upper left")
+    setattr(ax, "_style_legend_signature", signature)
 
 
 def _sync_strike_end_labels(
@@ -1021,15 +1065,24 @@ def _sync_maturity_guides(
     fig: Figure,
     ax: Axes,
     plotted_series: list[PlotSeries],
+    *,
+    mode: str = HISTORICAL_PLOT_MODE,
+    main_field: str | None = None,
+    underlying_overlay: UnderlyingOverlay | None = None,
+    secondary_overlay: SecondaryFieldOverlay | None = None,
 ) -> None:
+    _sync_maturity_legend(
+        ax,
+        mode=mode,
+        main_field=main_field,
+        underlying_overlay=underlying_overlay,
+        secondary_overlay=secondary_overlay,
+    )
+
     if len({series.maturity for series in plotted_series}) < 2:
         _clear_strike_end_labels(fig)
-        legend = cast(Any, ax).__dict__.get("legend_", None)
-        if legend is not None:
-            legend.remove()
         return
 
-    _sync_maturity_legend(ax, plotted_series)
     _sync_strike_end_labels(fig, ax, plotted_series)
 
 
@@ -1142,6 +1195,7 @@ def _refresh_visibility(
     visibility: PlotVisibility,
     underlying_overlay: UnderlyingOverlay | None = None,
     secondary_overlay: SecondaryFieldOverlay | None = None,
+    main_field: str | None = None,
 ) -> None:
     _apply_visibility(ax, plotted_series, visibility)
     if secondary_overlay is not None:
@@ -1156,7 +1210,15 @@ def _refresh_visibility(
     else:
         _ensure_leftmost_xtick_visible(fig, ax)
     _realign_strike_slider(fig, ax)
-    _sync_maturity_guides(fig, ax, plotted_series)
+    _sync_maturity_guides(
+        fig,
+        ax,
+        plotted_series,
+        mode=visibility.mode,
+        main_field=main_field,
+        underlying_overlay=underlying_overlay,
+        secondary_overlay=secondary_overlay,
+    )
     fig.canvas.draw_idle()
 
 
@@ -1330,6 +1392,7 @@ def add_strike_range_slider(
             visibility,
             active_underlying_overlay,
             active_secondary_overlay,
+            plot_context.field if plot_context is not None else None,
         )
 
     slider.on_changed(update)
@@ -1396,6 +1459,7 @@ def add_maturity_toggle(
             visibility,
             active_underlying_overlay,
             active_secondary_overlay,
+            plot_context.field if plot_context is not None else None,
         )
 
     toggle.on_clicked(update)
@@ -1418,7 +1482,7 @@ def _set_plot_field(
     _set_field_axis_direction(ax, field_spec.label)
     ax.set_ylabel(_field_ylabel(field_spec.label))
     _set_plot_title(ax, f"{title_prefix} · {field_spec.label}")
-    _sync_maturity_guides(fig, ax, plotted_series)
+    _sync_maturity_guides(fig, ax, plotted_series, main_field=field_spec.label)
     fig.canvas.draw_idle()
 
 
@@ -1636,6 +1700,7 @@ def _rebuild_plot_context(plot_context: PlotContext) -> None:
         plot_context.visibility,
         plot_context.underlying_overlay,
         plot_context.secondary_overlay,
+        field_spec.label,
     )
 
 
@@ -1818,6 +1883,7 @@ def main() -> int:
         visibility,
         plot_context.underlying_overlay,
         plot_context.secondary_overlay,
+        plot_context.field,
     )
     plt.show()
     return 0
