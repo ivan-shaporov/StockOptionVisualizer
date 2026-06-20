@@ -9,7 +9,7 @@ Download historical option prices from [marketdata.app](https://marketdata.app) 
 ## Contents
 
 - `download_option_data.py` — fetch historical option chains for a ticker into CSV.
-- `plot_option_prices.py` — interactive matplotlib viewer for the downloaded CSV (per-strike or all-strikes mode, maturity toggles, strike slider, underlying-price overlay).
+- `plot_option_prices.py` — interactive matplotlib viewer for the downloaded CSV with latest/historical mode toggle, maturity toggles, strike slider, historical underlying-price overlay, and latest-mode dashed companion axis.
 
 ## Setup
 

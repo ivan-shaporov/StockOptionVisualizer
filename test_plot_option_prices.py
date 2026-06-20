@@ -149,6 +149,121 @@ class PlotSingleContractTests(unittest.TestCase):
         self.assertEqual(kwargs["markersize"], 3)
 
 
+class LatestModeHelperTests(unittest.TestCase):
+    def test_filter_to_latest_timestamp_uses_strict_global_latest(self) -> None:
+        quotes = pd.DataFrame(
+            {
+                "updated": pd.to_datetime(
+                    [
+                        "2024-03-01",
+                        "2024-03-02",
+                        "2024-03-02",
+                        "2024-03-03",
+                    ]
+                ),
+                "maturityDate": [
+                    "2024-03-15",
+                    "2024-03-15",
+                    "2024-06-21",
+                    "2024-06-21",
+                ],
+                "strikePrice": [90.0, 90.0, 95.0, 100.0],
+                "mid": [1.0, 1.1, 2.0, 2.1],
+            }
+        )
+
+        latest = module.filter_to_latest_timestamp(quotes)
+
+        self.assertEqual(
+            latest["updated"].dt.strftime("%Y-%m-%d").tolist(),
+            ["2024-03-03"],
+        )
+        self.assertEqual(latest["strikePrice"].tolist(), [100.0])
+
+    def test_latest_mode_companion_field_switches_between_loss_and_ask(self) -> None:
+        self.assertEqual(module._latest_mode_companion_field("mid"), "loss")
+        self.assertEqual(module._latest_mode_companion_field("loss@30%"), "ask")
+
+    def test_build_plot_series_latest_mode_uses_strike_axis_per_maturity(self) -> None:
+        fake_ax = MagicMock()
+        lines = [MagicMock(), MagicMock()]
+        quotes = pd.DataFrame(
+            {
+                "updated": pd.to_datetime(
+                    [
+                        "2024-03-03",
+                        "2024-03-03",
+                        "2024-03-03",
+                        "2024-03-03",
+                    ]
+                ),
+                "maturityDate": [
+                    "2024-03-15",
+                    "2024-03-15",
+                    "2024-06-21",
+                    "2024-06-21",
+                ],
+                "strikePrice": [90.0, 95.0, 90.0, 95.0],
+                "mid": [1.0, 1.1, 2.0, 2.1],
+            }
+        )
+
+        with patch.object(module, "plot_single_contract", side_effect=lines) as plot_mock:
+            plotted = module.build_plot_series(
+                fake_ax,
+                quotes,
+                "mid",
+                mode=module.LATEST_PLOT_MODE,
+                maturity_colors={
+                    "2024-03-15": "C0",
+                    "2024-06-21": "C1",
+                },
+            )
+
+        self.assertEqual(len(plotted), 2)
+        self.assertEqual(plot_mock.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["label"] for call in plot_mock.call_args_list],
+            ["Expiry 2024-03-15", "Expiry 2024-06-21"],
+        )
+        self.assertTrue(
+            all(call.kwargs["x_field"] == "strikePrice" for call in plot_mock.call_args_list)
+        )
+        self.assertEqual(plotted[0].strike_values, (90.0, 95.0))
+        self.assertEqual(plotted[1].strike_values, (90.0, 95.0))
+
+
+class TitlePrefixTests(unittest.TestCase):
+    def test_title_prefix_includes_latest_underlying_price_when_available(self) -> None:
+        quotes = pd.DataFrame(
+            {
+                "underlying": ["AAPL", "AAPL"],
+                "updated": pd.to_datetime(["2024-03-01", "2024-03-02"]),
+                "underlyingPrice": [181.25, 182.5],
+                "strikePrice": [90.0, 90.0],
+                "maturityDate": ["2024-06-21", "2024-06-21"],
+            }
+        )
+
+        title_prefix = module._title_prefix(quotes, "2024-06-21", 90.0)
+
+        self.assertEqual(title_prefix, "AAPL @ 182.5 · Strike 90.0 · Expiry 2024-06-21")
+
+    def test_title_prefix_omits_underlying_price_when_unavailable(self) -> None:
+        quotes = pd.DataFrame(
+            {
+                "underlying": ["AAPL"],
+                "updated": pd.to_datetime(["2024-03-02"]),
+                "strikePrice": [90.0],
+                "maturityDate": ["2024-06-21"],
+            }
+        )
+
+        title_prefix = module._title_prefix(quotes, "2024-06-21", 90.0)
+
+        self.assertEqual(title_prefix, "AAPL · Strike 90.0 · Expiry 2024-06-21")
+
+
 class DefaultStrikeRangeTests(unittest.TestCase):
     def test_default_strike_range_bounds_targets_twenty_to_thirty_pct_below_latest_underlying(
         self,
@@ -808,7 +923,10 @@ class FieldToggleTests(unittest.TestCase):
         fake_ax.autoscale_view.assert_called_once_with()
         fake_ax.yaxis.set_inverted.assert_called_once_with(True)
         fake_ax.set_ylabel.assert_called_once_with("loss %")
-        fake_ax.set_title.assert_called_once_with("Strike 90 · Expiry 2024-06-21 · loss")
+        fake_ax.set_title.assert_called_once_with(
+            "Strike 90 · Expiry 2024-06-21 · loss",
+            loc="left",
+        )
         fake_fig.canvas.draw_idle.assert_called_once_with()
 
     def test_add_field_toggle_uses_overlay_plot_right_when_requested(self) -> None:
@@ -839,6 +957,129 @@ class FieldToggleTests(unittest.TestCase):
         fake_fig.subplots_adjust.assert_called_once_with(
             right=module.CONTROL_PANEL_PLOT_RIGHT_WITH_OVERLAY
         )
+
+
+class ModeToggleTests(unittest.TestCase):
+    def test_plot_quotes_for_mode_caches_latest_slice(self) -> None:
+        quotes = pd.DataFrame(
+            {
+                "updated": pd.to_datetime(["2024-03-01", "2024-03-02"]),
+                "strikePrice": [90.0, 95.0],
+                "maturityDate": ["2024-03-15", "2024-06-21"],
+                "mid": [1.0, 2.0],
+            }
+        )
+        latest_quotes = quotes.iloc[[1]].copy()
+        context = module.PlotContext(
+            fig=MagicMock(),
+            ax=MagicMock(),
+            quotes=quotes,
+            latest_quotes=None,
+            title_prefix="QQQ · All strikes",
+            field="mid",
+            visibility=module.PlotVisibility(
+                visible_maturities={"2024-03-15", "2024-06-21"},
+                mode=module.LATEST_PLOT_MODE,
+            ),
+            maturities=("2024-03-15", "2024-06-21"),
+            maturity_colors={"2024-03-15": "C0", "2024-06-21": "C1"},
+            plot_right=module.CONTROL_PANEL_PLOT_RIGHT,
+            plotted_series=[],
+        )
+
+        with patch.object(
+            module,
+            "filter_to_latest_timestamp",
+            return_value=latest_quotes,
+        ) as latest_mock:
+            first = module._plot_quotes_for_mode(context)
+            second = module._plot_quotes_for_mode(context)
+
+        self.assertIs(first, latest_quotes)
+        self.assertIs(second, latest_quotes)
+        latest_mock.assert_called_once_with(quotes)
+
+    def test_rebuild_plot_context_clears_stored_strike_labels_before_axis_reset(self) -> None:
+        fake_fig = MagicMock()
+        stale_label = MagicMock()
+        fake_fig._strike_end_labels = [stale_label]
+        fake_ax = MagicMock()
+        quotes = pd.DataFrame(
+            {
+                "updated": pd.to_datetime(["2024-03-02"]),
+                "strikePrice": [90.0],
+                "maturityDate": ["2024-06-21"],
+                "mid": [1.1],
+            }
+        )
+        context = module.PlotContext(
+            fig=fake_fig,
+            ax=fake_ax,
+            quotes=quotes,
+            latest_quotes=quotes.copy(),
+            title_prefix="QQQ · All strikes",
+            field="mid",
+            visibility=module.PlotVisibility(
+                visible_maturities={"2024-06-21"},
+                mode=module.LATEST_PLOT_MODE,
+            ),
+            maturities=("2024-06-21",),
+            maturity_colors={"2024-06-21": "C0"},
+            plot_right=module.CONTROL_PANEL_PLOT_RIGHT,
+            plotted_series=[],
+        )
+
+        with patch.object(module, "build_plot_series", return_value=[]):
+            with patch.object(module, "add_latest_field_overlay", return_value=None):
+                with patch.object(module, "_refresh_visibility"):
+                    module._rebuild_plot_context(context)
+
+        stale_label.remove.assert_called_once_with()
+        self.assertEqual(fake_fig._strike_end_labels, [])
+        fake_ax.clear.assert_called_once_with()
+
+    def test_add_mode_toggle_rebuilds_plot_for_selected_mode(self) -> None:
+        fake_fig = MagicMock()
+        fake_fig.add_axes.side_effect = [MagicMock(), MagicMock()]
+        fake_ax = MagicMock()
+        fake_ax.get_position.return_value.x0 = 0.12
+        fake_ax.get_position.return_value.x1 = 0.8
+        fake_ax.get_position.return_value.y1 = 0.88
+        latest_button = MagicMock()
+        historical_button = MagicMock()
+        context = module.PlotContext(
+            fig=fake_fig,
+            ax=fake_ax,
+            quotes=pd.DataFrame(),
+            latest_quotes=None,
+            title_prefix="QQQ · All strikes",
+            field="mid",
+            visibility=module.PlotVisibility(
+                visible_maturities={"2024-06-21"},
+                mode=module.LATEST_PLOT_MODE,
+            ),
+            maturities=("2024-06-21",),
+            maturity_colors={"2024-06-21": "C0"},
+            plot_right=module.CONTROL_PANEL_PLOT_RIGHT,
+            plotted_series=[],
+        )
+
+        with patch.object(module, "Button", side_effect=[latest_button, historical_button]):
+            with patch.object(module, "_rebuild_plot_context") as rebuild_mock:
+                toggle = module.add_mode_toggle(
+                    fake_fig,
+                    fake_ax,
+                    context.visibility,
+                    plot_context=context,
+                )
+
+                self.assertIs(toggle.latest_button, latest_button)
+                self.assertIs(toggle.historical_button, historical_button)
+                callback = historical_button.on_clicked.call_args.args[0]
+                callback(None)
+
+                self.assertEqual(context.visibility.mode, module.HISTORICAL_PLOT_MODE)
+                rebuild_mock.assert_called_once_with(context)
 
 
 class PlotAllStrikesTests(unittest.TestCase):
@@ -873,25 +1114,27 @@ class PlotAllStrikesTests(unittest.TestCase):
     def test_main_without_strike_plots_each_strike_for_all_maturities(self) -> None:
         quotes = pd.DataFrame(
             {
-                "underlying": ["AAPL"] * 5,
+                "underlying": ["AAPL"] * 6,
                 "updated": pd.to_datetime(
                     [
                         "2024-03-01",
                         "2024-03-02",
                         "2024-03-01",
                         "2024-03-02",
-                        "2024-02-20",
+                        "2024-03-02",
+                        "2024-03-02",
                     ]
                 ),
-                "strikePrice": [100.0, 100.0, 105.0, 105.0, 90.0],
+                "strikePrice": [100.0, 100.0, 105.0, 105.0, 90.0, 95.0],
                 "maturityDate": [
                     "2024-06-21",
                     "2024-06-21",
                     "2024-06-21",
                     "2024-06-21",
                     "2024-03-15",
+                    "2024-03-15",
                 ],
-                "mid": [1.0, 1.1, 2.0, 2.1, 0.5],
+                "mid": [1.0, 1.1, 2.0, 2.1, 0.5, 0.7],
             }
         )
 
@@ -905,9 +1148,10 @@ class PlotAllStrikesTests(unittest.TestCase):
             slider_sentinel = object()
             maturity_toggle_sentinel = object()
             field_toggle_sentinel = object()
+            mode_toggle_sentinel = object()
             plotted_lines = []
 
-            for color in ("C0", "C1", "C1"):
+            for color in ("C0", "C1"):
                 line = MagicMock()
                 line.get_color.return_value = color
                 plotted_lines.append(line)
@@ -920,48 +1164,58 @@ class PlotAllStrikesTests(unittest.TestCase):
                 with patch.dict(module.os.environ, {"PLOT_FIELD": "mid"}, clear=False):
                     with patch.object(module.plt, "subplots", return_value=(fake_fig, fake_ax)):
                         with patch.object(module.plt, "show"):
-                            with patch.object(module, "plot_single_contract") as plot_mock:
-                                plot_mock.side_effect = plotted_lines
-                                with patch.object(
-                                    module,
-                                    "add_strike_range_slider",
-                                    side_effect=add_slider,
-                                ) as slider_mock:
+                            with patch.object(module, "add_latest_field_overlay", return_value=None):
+                                with patch.object(module, "plot_single_contract") as plot_mock:
+                                    plot_mock.side_effect = plotted_lines
                                     with patch.object(
                                         module,
-                                        "add_maturity_toggle",
-                                        return_value=maturity_toggle_sentinel,
-                                    ) as maturity_mock:
+                                        "add_strike_range_slider",
+                                        side_effect=add_slider,
+                                    ) as slider_mock:
                                         with patch.object(
                                             module,
-                                            "add_field_toggle",
-                                            return_value=field_toggle_sentinel,
-                                        ) as field_mock:
-                                            rc = module.main()
+                                            "add_maturity_toggle",
+                                            return_value=maturity_toggle_sentinel,
+                                        ) as maturity_mock:
+                                            with patch.object(
+                                                module,
+                                                "add_field_toggle",
+                                                return_value=field_toggle_sentinel,
+                                            ) as field_mock:
+                                                with patch.object(
+                                                    module,
+                                                    "add_mode_toggle",
+                                                    return_value=mode_toggle_sentinel,
+                                                ) as mode_mock:
+                                                    rc = module.main()
 
         self.assertEqual(rc, 0)
-        self.assertEqual(plot_mock.call_count, 3)
+        self.assertEqual(plot_mock.call_count, 2)
         slider_mock.assert_called_once()
         maturity_mock.assert_called_once()
         field_mock.assert_called_once()
+        mode_mock.assert_called_once()
         fake_fig.tight_layout.assert_called_once_with()
         self.assertIs(fake_fig._strike_range_slider, slider_sentinel)
         self.assertIs(fake_fig._maturity_toggle, maturity_toggle_sentinel)
         self.assertIs(fake_fig._field_toggle, field_toggle_sentinel)
+        self.assertIs(fake_fig._mode_toggle, mode_toggle_sentinel)
 
         plotted_strikes = [call.kwargs["label"] for call in plot_mock.call_args_list]
         self.assertEqual(
             plotted_strikes,
             [
-                "Expiry 2024-03-15 · Strike 90",
-                "Expiry 2024-06-21 · Strike 100",
-                "Expiry 2024-06-21 · Strike 105",
+                "Expiry 2024-03-15",
+                "Expiry 2024-06-21",
             ],
         )
 
         self.assertEqual(
             [call.kwargs["color"] for call in plot_mock.call_args_list],
-            ["C0", "C1", "C1"],
+            ["C0", "C1"],
+        )
+        self.assertTrue(
+            all(call.kwargs["x_field"] == "strikePrice" for call in plot_mock.call_args_list)
         )
         for call in plot_mock.call_args_list:
             self.assertEqual(call.kwargs["linestyle"], "-")
@@ -1000,6 +1254,7 @@ class PlotAllStrikesTests(unittest.TestCase):
             fake_ax.legend_ = None
             maturity_toggle_sentinel = object()
             field_toggle_sentinel = object()
+            mode_toggle_sentinel = object()
             plotted_lines = []
 
             for color in ("C0", "C1"):
@@ -1011,40 +1266,51 @@ class PlotAllStrikesTests(unittest.TestCase):
                 with patch.dict(module.os.environ, {"PLOT_FIELD": "mid"}, clear=False):
                     with patch.object(module.plt, "subplots", return_value=(fake_fig, fake_ax)):
                         with patch.object(module.plt, "show"):
-                            with patch.object(module, "plot_single_contract") as plot_mock:
-                                plot_mock.side_effect = plotted_lines
-                                with patch.object(
-                                    module,
-                                    "add_strike_range_slider",
-                                ) as slider_mock:
+                            with patch.object(module, "add_latest_field_overlay", return_value=None):
+                                with patch.object(module, "plot_single_contract") as plot_mock:
+                                    plot_mock.side_effect = plotted_lines
                                     with patch.object(
                                         module,
-                                        "add_maturity_toggle",
-                                        return_value=maturity_toggle_sentinel,
-                                    ) as maturity_mock:
+                                        "add_strike_range_slider",
+                                    ) as slider_mock:
                                         with patch.object(
                                             module,
-                                            "add_field_toggle",
-                                            return_value=field_toggle_sentinel,
-                                        ) as field_mock:
-                                            rc = module.main()
+                                            "add_maturity_toggle",
+                                            return_value=maturity_toggle_sentinel,
+                                        ) as maturity_mock:
+                                            with patch.object(
+                                                module,
+                                                "add_field_toggle",
+                                                return_value=field_toggle_sentinel,
+                                            ) as field_mock:
+                                                with patch.object(
+                                                    module,
+                                                    "add_mode_toggle",
+                                                    return_value=mode_toggle_sentinel,
+                                                ) as mode_mock:
+                                                    rc = module.main()
 
         self.assertEqual(rc, 0)
-        self.assertEqual(plot_mock.call_count, 2)
+        self.assertEqual(plot_mock.call_count, 1)
         slider_mock.assert_not_called()
         maturity_mock.assert_called_once()
         field_mock.assert_called_once()
+        mode_mock.assert_called_once()
         self.assertIs(fake_fig._maturity_toggle, maturity_toggle_sentinel)
         self.assertIs(fake_fig._field_toggle, field_toggle_sentinel)
+        self.assertIs(fake_fig._mode_toggle, mode_toggle_sentinel)
 
         plotted_labels = [call.kwargs["label"] for call in plot_mock.call_args_list]
         self.assertEqual(
             plotted_labels,
-            ["Expiry 2024-03-15", "Expiry 2024-06-21"],
+            ["Expiry 2024-06-21"],
         )
         self.assertEqual(
             [call.kwargs["color"] for call in plot_mock.call_args_list],
-            ["C0", "C1"],
+            ["C1"],
+        )
+        self.assertTrue(
+            all(call.kwargs["x_field"] == "strikePrice" for call in plot_mock.call_args_list)
         )
         for call in plot_mock.call_args_list:
             self.assertEqual(call.kwargs["linestyle"], "-")
@@ -1106,16 +1372,21 @@ class PlotAllStrikesTests(unittest.TestCase):
                             rc = module.main()
 
         self.assertEqual(rc, 0)
-        fake_ax.set_title.assert_any_call("AAPL · Strike 90.0 · Expiry 2024-06-21 · loss@30%")
+        fake_ax.set_title.assert_any_call(
+            "AAPL @ 98 · Strike 90.0 · Expiry 2024-06-21 · loss@30%",
+            loc="left",
+        )
 
-    def test_main_adds_underlying_overlay_when_available(self) -> None:
+    def test_main_adds_latest_overlay_when_available(self) -> None:
         quotes = pd.DataFrame(
             {
                 "underlying": ["AAPL", "AAPL"],
+                "optionSymbol": ["AAPL240621P00100000", "AAPL240621P00100000"],
                 "updated": pd.to_datetime(["2024-03-01", "2024-03-02"]),
                 "strikePrice": [100.0, 100.0],
                 "maturityDate": ["2024-06-21", "2024-06-21"],
                 "mid": [1.0, 1.1],
+                "ask": [2.0, 2.1],
                 "underlyingPrice": [100.0, 100.2],
             }
         )
@@ -1126,7 +1397,11 @@ class PlotAllStrikesTests(unittest.TestCase):
 
             fake_fig = MagicMock()
             fake_ax = MagicMock()
-            overlay_sentinel = object()
+            overlay_sentinel = module.SecondaryFieldOverlay(
+                ax=MagicMock(),
+                plotted_series=[],
+                field="loss",
+            )
 
             with patch("sys.argv", ["plot_option_prices.py", str(csv_path)]):
                 with patch.dict(module.os.environ, {"PLOT_FIELD": "mid"}, clear=False):
@@ -1134,14 +1409,14 @@ class PlotAllStrikesTests(unittest.TestCase):
                         with patch.object(module.plt, "show"):
                             with patch.object(
                                 module,
-                                "add_underlying_overlay",
+                                "add_latest_field_overlay",
                                 return_value=overlay_sentinel,
                             ) as overlay_mock:
                                 rc = module.main()
 
         self.assertEqual(rc, 0)
         overlay_mock.assert_called_once()
-        self.assertIs(fake_fig._underlying_overlay, overlay_sentinel)
+        self.assertIs(fake_fig._secondary_overlay, overlay_sentinel)
 
 
 if __name__ == "__main__":

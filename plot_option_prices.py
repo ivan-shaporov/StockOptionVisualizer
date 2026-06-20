@@ -26,6 +26,16 @@ shown.
 The plot shows radio-button toggles for each available plot field so the
 visible series can be switched without reloading the CSV.
 
+The plot starts in Latest mode, which shows the values for the single global
+latest quote timestamp against strike price on the x-axis. Historical mode
+shows the existing time-series view. A title-row toggle switches between
+those modes without reloading the CSV.
+
+In Latest mode, a dashed secondary right-axis line is added for each visible
+maturity in the same color as the primary line. That secondary field is loss
+when the main field is not loss, or ask when the main field is loss. The
+time-based underlying-price overlay remains available in Historical mode.
+
 If the CSV path is omitted, it is resolved from environment variables
 (loaded from .env if present):
     PLOT_CSV          explicit path to a CSV file (wins if set)
@@ -65,7 +75,7 @@ from matplotlib.axes import Axes
 from matplotlib.collections import PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.widgets import CheckButtons, RadioButtons, RangeSlider
+from matplotlib.widgets import Button, CheckButtons, RadioButtons, RangeSlider
 
 try:
     from dotenv import load_dotenv
@@ -84,6 +94,7 @@ DEFAULT_INITIAL_STRIKE_MIN_PRICE_FRACTION = 0.7
 DEFAULT_INITIAL_STRIKE_MAX_PRICE_FRACTION = 0.8
 LOSS_FIELD_REQUIREMENTS = ("optionSymbol", "underlyingPrice", "strikePrice", "ask")
 END_LABEL_X_MARGIN = 0.1
+LATEST_MODE_X_MARGIN = 0.02
 CONTROL_PANEL_WIDTH = 0.12
 CONTROL_PANEL_LEFT = 0.86
 CONTROL_PANEL_PLOT_RIGHT = 0.81
@@ -96,6 +107,16 @@ STRIKE_SLIDER_BOTTOM = 0.04
 STRIKE_SLIDER_WIDTH = 0.64
 STRIKE_SLIDER_HEIGHT = 0.04
 STRIKE_SLIDER_LABEL = "Strike"
+HISTORICAL_PLOT_MODE = "historical"
+LATEST_PLOT_MODE = "latest"
+MODE_TOGGLE_BUTTON_WIDTH = 0.07
+MODE_TOGGLE_BUTTON_HEIGHT = 0.04
+MODE_TOGGLE_BUTTON_GAP = 0.008
+MODE_TOGGLE_VERTICAL_OFFSET = 0.01
+MODE_TOGGLE_ACTIVE_COLOR = "0.85"
+MODE_TOGGLE_INACTIVE_COLOR = "0.95"
+MODE_TOGGLE_ACTIVE_TEXT_COLOR = "0.05"
+MODE_TOGGLE_INACTIVE_TEXT_COLOR = "0.35"
 XTICK_LABEL_FIGURE_LEFT_PADDING = 0.01
 XTICK_LABEL_ROTATION = 30.0
 MIN_PLOT_WIDTH = 0.2
@@ -106,13 +127,17 @@ class PlotSeries:
     line: Line2D
     quotes: pd.DataFrame
     maturity: str
-    strike: float
+    strike: float | None
+    field: str = ""
+    x_field: str = "updated"
+    strike_values: tuple[float, ...] = ()
 
 
 @dataclass
 class PlotVisibility:
     visible_maturities: set[str]
     strike_bounds: tuple[float, float] | None = None
+    mode: str = HISTORICAL_PLOT_MODE
 
 
 @dataclass
@@ -122,11 +147,41 @@ class UnderlyingOverlay:
     band: PolyCollection | None = None
 
 
+@dataclass
+class SecondaryFieldOverlay:
+    ax: Axes
+    plotted_series: list[PlotSeries]
+    field: str
+
+
+@dataclass
+class ModeToggle:
+    latest_button: Button
+    historical_button: Button
+
+
 @dataclass(frozen=True)
 class PlotFieldSpec:
     key: str
     label: str
     crash_price_fraction: float = CRASH_PRICE_FRACTION
+
+
+@dataclass
+class PlotContext:
+    fig: Figure
+    ax: Axes
+    quotes: pd.DataFrame
+    latest_quotes: pd.DataFrame | None
+    title_prefix: str
+    field: str
+    visibility: PlotVisibility
+    maturities: tuple[str, ...]
+    maturity_colors: dict[str, str]
+    plot_right: float
+    plotted_series: list[PlotSeries]
+    underlying_overlay: UnderlyingOverlay | None = None
+    secondary_overlay: SecondaryFieldOverlay | None = None
 
 
 def load_quotes(csv_path: Path) -> pd.DataFrame:
@@ -285,6 +340,55 @@ def prepare_quotes_for_field(quotes: pd.DataFrame, field: str) -> pd.DataFrame:
     return prepared
 
 
+def filter_to_latest_timestamp(quotes: pd.DataFrame) -> pd.DataFrame:
+    if quotes.empty or "updated" not in quotes.columns:
+        return quotes
+
+    latest_timestamp = quotes["updated"].max()
+    if pd.isna(latest_timestamp):
+        return quotes.iloc[0:0].copy()
+
+    return quotes.loc[quotes["updated"] == latest_timestamp].sort_values(
+        ["maturityDate", "strikePrice", "updated"]
+    )
+
+
+def _latest_mode_companion_field(field: str) -> str:
+    return "ask" if parse_plot_field(field).key == LOSS_FIELD else LOSS_FIELD
+
+
+def _plot_mode_xlabel(mode: str) -> str:
+    if mode == LATEST_PLOT_MODE:
+        return "Strike price"
+    return "Quote date"
+
+
+def _build_maturity_color_map(maturities: tuple[str, ...]) -> dict[str, str]:
+    return {
+        maturity: f"C{index % 10}"
+        for index, maturity in enumerate(maturities)
+    }
+
+
+def _plot_right_for_quotes(quotes: pd.DataFrame, field: str) -> float:
+    companion_field = _latest_mode_companion_field(field)
+    companion_key = parse_plot_field(companion_field).key
+    has_historical_overlay = UNDERLYING_PRICE_FIELD in quotes.columns
+    has_latest_overlay = companion_key in _available_plot_field_keys(quotes)
+    if has_historical_overlay or has_latest_overlay:
+        return CONTROL_PANEL_PLOT_RIGHT_WITH_OVERLAY
+    return CONTROL_PANEL_PLOT_RIGHT
+
+
+def _plot_quotes_for_mode(plot_context: PlotContext) -> pd.DataFrame:
+    if plot_context.visibility.mode != LATEST_PLOT_MODE:
+        return plot_context.quotes
+
+    if plot_context.latest_quotes is None:
+        plot_context.latest_quotes = filter_to_latest_timestamp(plot_context.quotes)
+    return plot_context.latest_quotes
+
+
 def _group_quotes_by_strike(quotes: pd.DataFrame) -> dict[float, pd.DataFrame]:
     grouped_quotes: dict[float, pd.DataFrame] = {}
     for strike, strike_quotes in quotes.groupby("strikePrice", sort=True):
@@ -361,7 +465,7 @@ def _snap_strike_bounds(
     return lower_bound, upper_bound
 
 
-def _format_slider_value(value: float) -> str:
+def _format_display_value(value: float) -> str:
     formatted = f"{value:.2f}".rstrip("0").rstrip(".")
     if formatted == "-0":
         return "0"
@@ -377,7 +481,7 @@ def _format_strike_range_text(
     reference_price: float | None = None,
 ) -> str:
     lower, upper = sorted(bounds)
-    text = f"[{_format_slider_value(lower)}, {_format_slider_value(upper)}]"
+    text = f"[{_format_display_value(lower)}, {_format_display_value(upper)}]"
     if reference_price is None or reference_price <= 0:
         return text
 
@@ -448,12 +552,14 @@ def plot_single_contract(
     quotes: pd.DataFrame,
     field: str,
     label: str | None = None,
+    *,
+    x_field: str = "updated",
     **plot_kwargs: Any,
 ) -> Line2D:
     line_kwargs: dict[str, Any] = dict(plot_kwargs)
     line_kwargs.setdefault("marker", "o")
     line_kwargs.setdefault("markersize", 3)
-    return ax.plot(quotes["updated"], quotes[field], label=label, **line_kwargs)[0]
+    return ax.plot(quotes[x_field], quotes[field], label=label, **line_kwargs)[0]
 
 
 def plot_all_strikes(
@@ -464,6 +570,7 @@ def plot_all_strikes(
     color: str = "C0",
     label_prefix: str = "Strike",
     include_strike_in_label: bool = True,
+    **plot_kwargs: Any,
 ) -> dict[float, Line2D]:
     lines_by_strike: dict[float, Line2D] = {}
     for strike, strike_quotes in _group_quotes_by_strike(quotes).items():
@@ -476,32 +583,44 @@ def plot_all_strikes(
             field,
             label=label,
             color=color,
-            linestyle="-",
+            **plot_kwargs,
         )
     return lines_by_strike
 
 
-def build_plot_series(
+def _build_historical_plot_series(
     ax: Axes,
     quotes: pd.DataFrame,
     field: str,
+    *,
+    maturity_colors: dict[str, str] | None = None,
+    linestyle: str = "-",
+    linewidth: float | None = None,
+    alpha: float | None = None,
 ) -> list[PlotSeries]:
     plotted_series: list[PlotSeries] = []
+    colors = maturity_colors or _build_maturity_color_map(available_maturities(quotes))
     overall_strike_count = len(_group_quotes_by_strike(quotes))
-    for index, maturity in enumerate(available_maturities(quotes)):
+    for maturity in available_maturities(quotes):
         maturity_quotes = filter_by_maturity(quotes, maturity)
         grouped_quotes = _group_quotes_by_strike(maturity_quotes)
+        line_kwargs: dict[str, Any] = {"linestyle": linestyle}
+        if linewidth is not None:
+            line_kwargs["linewidth"] = linewidth
+        if alpha is not None:
+            line_kwargs["alpha"] = alpha
         lines_by_strike = plot_all_strikes(
             ax,
             maturity_quotes,
             field,
-            color=f"C{index % 10}",
+            color=colors[maturity],
             label_prefix=(
                 f"Expiry {maturity}"
                 if overall_strike_count == 1
                 else f"Expiry {maturity} · Strike"
             ),
             include_strike_in_label=overall_strike_count > 1,
+            **line_kwargs,
         )
         for strike, line in lines_by_strike.items():
             plotted_series.append(
@@ -510,9 +629,96 @@ def build_plot_series(
                     quotes=grouped_quotes[strike],
                     maturity=maturity,
                     strike=strike,
+                    field=field,
+                    x_field="updated",
+                    strike_values=(strike,),
                 )
             )
     return plotted_series
+
+
+def _build_latest_plot_series(
+    ax: Axes,
+    quotes: pd.DataFrame,
+    field: str,
+    *,
+    maturity_colors: dict[str, str] | None = None,
+    linestyle: str = "-",
+    linewidth: float | None = None,
+    alpha: float | None = None,
+) -> list[PlotSeries]:
+    plotted_series: list[PlotSeries] = []
+    colors = maturity_colors or _build_maturity_color_map(available_maturities(quotes))
+    for maturity in available_maturities(quotes):
+        maturity_quotes = filter_by_maturity(quotes, maturity).sort_values("strikePrice")
+        line_kwargs: dict[str, Any] = {
+            "color": colors[maturity],
+            "linestyle": linestyle,
+        }
+        if linewidth is not None:
+            line_kwargs["linewidth"] = linewidth
+        if alpha is not None:
+            line_kwargs["alpha"] = alpha
+        line = plot_single_contract(
+            ax,
+            maturity_quotes,
+            field,
+            label=f"Expiry {maturity}",
+            x_field="strikePrice",
+            **line_kwargs,
+        )
+        strike_values = tuple(
+            sorted(
+                {
+                    float(cast(Any, value))
+                    for value in maturity_quotes["strikePrice"].dropna().unique()
+                }
+            )
+        )
+        plotted_series.append(
+            PlotSeries(
+                line=line,
+                quotes=maturity_quotes,
+                maturity=maturity,
+                strike=None,
+                field=field,
+                x_field="strikePrice",
+                strike_values=strike_values,
+            )
+        )
+    return plotted_series
+
+
+def build_plot_series(
+    ax: Axes,
+    quotes: pd.DataFrame,
+    field: str,
+    *,
+    mode: str = HISTORICAL_PLOT_MODE,
+    maturity_colors: dict[str, str] | None = None,
+    linestyle: str = "-",
+    linewidth: float | None = None,
+    alpha: float | None = None,
+) -> list[PlotSeries]:
+    if mode == LATEST_PLOT_MODE:
+        return _build_latest_plot_series(
+            ax,
+            quotes,
+            field,
+            maturity_colors=maturity_colors,
+            linestyle=linestyle,
+            linewidth=linewidth,
+            alpha=alpha,
+        )
+    return _build_historical_plot_series(
+        ax,
+        quotes,
+        field,
+        maturity_colors=maturity_colors,
+        linestyle=linestyle,
+        linewidth=linewidth,
+        alpha=alpha,
+    )
 
 
 def _maturity_colors(plotted_series: list[PlotSeries]) -> dict[str, str]:
@@ -543,8 +749,52 @@ def _series_in_strike_bounds(
 ) -> bool:
     if strike_bounds is None:
         return True
+    series_strikes = _series_strikes(series)
+    if not series_strikes:
+        return True
     lower, upper = sorted(strike_bounds)
-    return lower <= series.strike <= upper
+    return any(lower <= strike <= upper for strike in series_strikes)
+
+
+def _series_strikes(series: PlotSeries) -> tuple[float, ...]:
+    if series.strike_values:
+        return series.strike_values
+    if series.strike is not None:
+        return (series.strike,)
+    if "strikePrice" not in series.quotes.columns:
+        return ()
+    return tuple(
+        sorted(
+            {
+                float(cast(Any, value))
+                for value in series.quotes["strikePrice"].dropna().unique()
+            }
+        )
+    )
+
+
+def _can_refresh_series_from_quotes(series: PlotSeries) -> bool:
+    return (
+        bool(series.field)
+        and series.x_field in series.quotes.columns
+        and series.field in series.quotes.columns
+    )
+
+
+def _visible_quotes_for_series(
+    series: PlotSeries,
+    visibility: PlotVisibility,
+) -> pd.DataFrame:
+    if series.maturity not in visibility.visible_maturities:
+        return series.quotes.iloc[0:0]
+
+    visible_quotes = series.quotes
+    if visibility.strike_bounds is None or "strikePrice" not in visible_quotes.columns:
+        return visible_quotes
+
+    lower, upper = sorted(visibility.strike_bounds)
+    strike_values = pd.to_numeric(visible_quotes["strikePrice"], errors="coerce")
+    return visible_quotes.loc[strike_values.between(lower, upper)]
 
 
 def _visible_underlying_price_summary(
@@ -669,6 +919,41 @@ def add_underlying_overlay(
     return overlay
 
 
+def add_latest_field_overlay(
+    ax: Axes,
+    quotes: pd.DataFrame,
+    field: str,
+    maturity_colors: dict[str, str],
+) -> SecondaryFieldOverlay | None:
+    field_spec = parse_plot_field(field)
+    if field_spec.key not in _available_plot_field_keys(quotes):
+        return None
+
+    overlay_ax = ax.twinx()
+    overlay_ax.set_ylabel(_field_ylabel(field_spec.label))
+    overlay_ax.grid(False)
+    overlay_ax.tick_params(axis="y", colors="0.25")
+    _set_field_axis_direction(overlay_ax, field_spec.label)
+    plotted_series = build_plot_series(
+        overlay_ax,
+        quotes,
+        field_spec.key,
+        mode=LATEST_PLOT_MODE,
+        maturity_colors=maturity_colors,
+        linestyle="--",
+        linewidth=2,
+        alpha=0.9,
+    )
+    if not plotted_series:
+        overlay_ax.remove()
+        return None
+    return SecondaryFieldOverlay(
+        ax=overlay_ax,
+        plotted_series=plotted_series,
+        field=field_spec.label,
+    )
+
+
 def _clear_strike_end_labels(fig: Figure) -> None:
     stored_labels = cast(Any, fig).__dict__.get("_strike_end_labels", [])
     for label in stored_labels:
@@ -711,6 +996,8 @@ def _sync_strike_end_labels(
     visible_series = [
         series for series in plotted_series if series.line.get_visible()
     ]
+    if any(series.x_field == "strikePrice" for series in visible_series):
+        return
     if len({series.strike for series in visible_series}) < 2:
         return
 
@@ -759,13 +1046,31 @@ def _apply_visibility(
     plotted_series: list[PlotSeries],
     visibility: PlotVisibility,
 ) -> None:
-    ax.set_xmargin(END_LABEL_X_MARGIN)
-    strike_bounds = visibility.strike_bounds
+    ax.set_xmargin(
+        LATEST_MODE_X_MARGIN
+        if visibility.mode == LATEST_PLOT_MODE
+        else END_LABEL_X_MARGIN
+    )
     for series in plotted_series:
+        if _can_refresh_series_from_quotes(series):
+            visible_quotes = _visible_quotes_for_series(series, visibility)
+            if visible_quotes.empty:
+                series.line.set_data([], [])
+                series.line.set_visible(False)
+                continue
+            series.line.set_data(
+                visible_quotes[series.x_field],
+                visible_quotes[series.field],
+            )
+            series.line.set_visible(True)
+            continue
+
         is_visible = series.maturity in visibility.visible_maturities
-        if strike_bounds is not None:
-            lower, upper = sorted(strike_bounds)
-            is_visible = is_visible and lower <= series.strike <= upper
+        if visibility.strike_bounds is not None:
+            is_visible = is_visible and _series_in_strike_bounds(
+                series,
+                visibility.strike_bounds,
+            )
         series.line.set_visible(is_visible)
     ax.relim(visible_only=True)
     ax.autoscale_view()
@@ -781,6 +1086,14 @@ def _reset_xtick_label_alignment(ax: Axes) -> None:
         label.set_rotation(XTICK_LABEL_ROTATION)
         label.set_rotation_mode("anchor")
         label.set_ha("right")
+
+
+def _reset_numeric_xtick_alignment(ax: Axes) -> None:
+    ax.tick_params(axis="x", labelrotation=0)
+    for label in _visible_xtick_labels(ax):
+        label.set_rotation(0)
+        label.set_rotation_mode("default")
+        label.set_ha("center")
 
 
 def _ensure_leftmost_xtick_visible(
@@ -836,11 +1149,20 @@ def _refresh_visibility(
     plotted_series: list[PlotSeries],
     visibility: PlotVisibility,
     underlying_overlay: UnderlyingOverlay | None = None,
+    secondary_overlay: SecondaryFieldOverlay | None = None,
 ) -> None:
     _apply_visibility(ax, plotted_series, visibility)
+    if secondary_overlay is not None:
+        _apply_visibility(secondary_overlay.ax, secondary_overlay.plotted_series, visibility)
+        secondary_overlay.ax.set_visible(
+            any(series.line.get_visible() for series in secondary_overlay.plotted_series)
+        )
     if underlying_overlay is not None:
         _update_underlying_overlay(underlying_overlay, plotted_series, visibility)
-    _ensure_leftmost_xtick_visible(fig, ax)
+    if visibility.mode == LATEST_PLOT_MODE:
+        _reset_numeric_xtick_alignment(ax)
+    else:
+        _ensure_leftmost_xtick_visible(fig, ax)
     _realign_strike_slider(fig, ax)
     _sync_maturity_guides(fig, ax, plotted_series)
     fig.canvas.draw_idle()
@@ -946,8 +1268,15 @@ def add_strike_range_slider(
     reference_price: float | None = None,
     *,
     plot_right: float | None = None,
+    plot_context: PlotContext | None = None,
 ) -> RangeSlider | None:
-    strikes = sorted({series.strike for series in plotted_series})
+    strikes = sorted(
+        {
+            strike
+            for series in plotted_series
+            for strike in _series_strikes(series)
+        }
+    )
     if len(strikes) < 2:
         return None
 
@@ -993,7 +1322,23 @@ def add_strike_range_slider(
             visibility.strike_bounds,
             reference_price,
         )
-        _refresh_visibility(fig, ax, plotted_series, visibility, underlying_overlay)
+        active_plotted_series = (
+            plot_context.plotted_series if plot_context is not None else plotted_series
+        )
+        active_underlying_overlay = (
+            plot_context.underlying_overlay if plot_context is not None else underlying_overlay
+        )
+        active_secondary_overlay = (
+            plot_context.secondary_overlay if plot_context is not None else None
+        )
+        _refresh_visibility(
+            fig,
+            ax,
+            active_plotted_series,
+            visibility,
+            active_underlying_overlay,
+            active_secondary_overlay,
+        )
 
     slider.on_changed(update)
     return slider
@@ -1008,6 +1353,8 @@ def add_maturity_toggle(
     underlying_overlay: UnderlyingOverlay | None = None,
     *,
     plot_right: float = CONTROL_PANEL_PLOT_RIGHT,
+    maturity_colors: dict[str, str] | None = None,
+    plot_context: PlotContext | None = None,
 ) -> CheckButtons | None:
     if len(maturities) < 2:
         return None
@@ -1030,9 +1377,9 @@ def add_maturity_toggle(
         labels=maturities,
         actives=[maturity in visibility.visible_maturities for maturity in maturities],
     )
-    colors = _maturity_colors(plotted_series)
+    colors = maturity_colors or _maturity_colors(plotted_series)
     for label, maturity in zip(toggle.labels, maturities):
-        label.set_color(colors[maturity])
+        label.set_color(colors.get(maturity, "0.1"))
 
     def update(selected_maturity: str | None) -> None:
         if selected_maturity is None:
@@ -1041,7 +1388,23 @@ def add_maturity_toggle(
             visibility.visible_maturities.remove(selected_maturity)
         else:
             visibility.visible_maturities.add(selected_maturity)
-        _refresh_visibility(fig, ax, plotted_series, visibility, underlying_overlay)
+        active_plotted_series = (
+            plot_context.plotted_series if plot_context is not None else plotted_series
+        )
+        active_underlying_overlay = (
+            plot_context.underlying_overlay if plot_context is not None else underlying_overlay
+        )
+        active_secondary_overlay = (
+            plot_context.secondary_overlay if plot_context is not None else None
+        )
+        _refresh_visibility(
+            fig,
+            ax,
+            active_plotted_series,
+            visibility,
+            active_underlying_overlay,
+            active_secondary_overlay,
+        )
 
     toggle.on_clicked(update)
     return toggle
@@ -1062,7 +1425,7 @@ def _set_plot_field(
     ax.autoscale_view()
     _set_field_axis_direction(ax, field_spec.label)
     ax.set_ylabel(_field_ylabel(field_spec.label))
-    ax.set_title(f"{title_prefix} · {field_spec.label}")
+    _set_plot_title(ax, f"{title_prefix} · {field_spec.label}")
     _sync_maturity_guides(fig, ax, plotted_series)
     fig.canvas.draw_idle()
 
@@ -1076,6 +1439,7 @@ def add_field_toggle(
     title_prefix: str,
     *,
     plot_right: float = CONTROL_PANEL_PLOT_RIGHT,
+    plot_context: PlotContext | None = None,
 ) -> RadioButtons | None:
     if len(fields) < 2:
         return None
@@ -1091,14 +1455,99 @@ def add_field_toggle(
     def update(selected_field: str | None) -> None:
         if selected_field is None:
             return
+        if plot_context is not None:
+            plot_context.field = selected_field
+            _rebuild_plot_context(plot_context)
+            return
         _set_plot_field(fig, ax, plotted_series, selected_field, title_prefix)
 
     toggle.on_clicked(update)
     return toggle
 
 
+def _style_mode_button(button: Button, is_active: bool) -> None:
+    button.color = MODE_TOGGLE_ACTIVE_COLOR if is_active else MODE_TOGGLE_INACTIVE_COLOR
+    button.hovercolor = button.color
+    button.ax.set_facecolor(button.color)
+    button.label.set_color(
+        MODE_TOGGLE_ACTIVE_TEXT_COLOR
+        if is_active
+        else MODE_TOGGLE_INACTIVE_TEXT_COLOR
+    )
+
+
+def _set_mode_toggle_state(toggle: ModeToggle, mode: str) -> None:
+    _style_mode_button(toggle.latest_button, mode == LATEST_PLOT_MODE)
+    _style_mode_button(toggle.historical_button, mode == HISTORICAL_PLOT_MODE)
+
+
+def add_mode_toggle(
+    fig: Figure,
+    ax: Axes,
+    visibility: PlotVisibility,
+    *,
+    plot_context: PlotContext | None = None,
+) -> ModeToggle:
+    plot_left, plot_right = _axis_box_x_bounds(ax)
+    _, plot_top = _axis_box_y_bounds(ax)
+    right = plot_right if plot_right is not None else 0.9
+    left = max(
+        right - ((MODE_TOGGLE_BUTTON_WIDTH * 2) + MODE_TOGGLE_BUTTON_GAP),
+        plot_left if plot_left is not None else 0.1,
+    )
+    bottom = min(
+        (plot_top if plot_top is not None else CONTROL_PANEL_DEFAULT_TOP)
+        + MODE_TOGGLE_VERTICAL_OFFSET,
+        0.98 - MODE_TOGGLE_BUTTON_HEIGHT,
+    )
+    latest_ax = fig.add_axes(
+        (left, bottom, MODE_TOGGLE_BUTTON_WIDTH, MODE_TOGGLE_BUTTON_HEIGHT)
+    )
+    historical_ax = fig.add_axes(
+        (
+            left + MODE_TOGGLE_BUTTON_WIDTH + MODE_TOGGLE_BUTTON_GAP,
+            bottom,
+            MODE_TOGGLE_BUTTON_WIDTH,
+            MODE_TOGGLE_BUTTON_HEIGHT,
+        )
+    )
+    latest_button = Button(
+        latest_ax,
+        "Latest",
+        color=MODE_TOGGLE_INACTIVE_COLOR,
+        hovercolor=MODE_TOGGLE_INACTIVE_COLOR,
+    )
+    historical_button = Button(
+        historical_ax,
+        "Historical",
+        color=MODE_TOGGLE_INACTIVE_COLOR,
+        hovercolor=MODE_TOGGLE_INACTIVE_COLOR,
+    )
+    toggle = ModeToggle(
+        latest_button=latest_button,
+        historical_button=historical_button,
+    )
+    _set_mode_toggle_state(toggle, visibility.mode)
+
+    def set_mode(mode: str) -> None:
+        if visibility.mode == mode:
+            return
+        visibility.mode = mode
+        _set_mode_toggle_state(toggle, mode)
+        if plot_context is not None:
+            _rebuild_plot_context(plot_context)
+
+    latest_button.on_clicked(lambda _event: set_mode(LATEST_PLOT_MODE))
+    historical_button.on_clicked(lambda _event: set_mode(HISTORICAL_PLOT_MODE))
+    return toggle
+
+
 def _remember_control(fig: Figure, name: str, control: object) -> None:
     setattr(fig, name, control)
+
+
+def _set_plot_title(ax: Axes, title: str) -> None:
+    ax.set_title(title, loc="left")
 
 
 def _suppress_default_figure_title(fig: Figure) -> None:
@@ -1141,6 +1590,63 @@ def _set_field_axis_direction(ax: Axes, field: str) -> None:
     ax.yaxis.set_inverted(parse_plot_field(field).key == LOSS_FIELD)
 
 
+def _remove_overlay_axes(plot_context: PlotContext) -> None:
+    if plot_context.underlying_overlay is not None:
+        plot_context.underlying_overlay.ax.remove()
+        plot_context.underlying_overlay = None
+    if plot_context.secondary_overlay is not None:
+        plot_context.secondary_overlay.ax.remove()
+        plot_context.secondary_overlay = None
+
+
+def _rebuild_plot_context(plot_context: PlotContext) -> None:
+    _remove_overlay_axes(plot_context)
+    _clear_strike_end_labels(plot_context.fig)
+    plot_context.ax.clear()
+
+    plot_quotes = _plot_quotes_for_mode(plot_context)
+    field_spec = parse_plot_field(plot_context.field)
+    plot_context.plotted_series = build_plot_series(
+        plot_context.ax,
+        plot_quotes,
+        field_spec.key,
+        mode=plot_context.visibility.mode,
+        maturity_colors=plot_context.maturity_colors,
+    )
+    if plot_context.visibility.mode == HISTORICAL_PLOT_MODE:
+        plot_context.underlying_overlay = add_underlying_overlay(
+            plot_context.ax,
+            plot_context.plotted_series,
+        )
+        plot_context.secondary_overlay = None
+    else:
+        plot_context.secondary_overlay = add_latest_field_overlay(
+            plot_context.ax,
+            plot_quotes,
+            _latest_mode_companion_field(plot_context.field),
+            plot_context.maturity_colors,
+        )
+        plot_context.underlying_overlay = None
+
+    _remember_control(plot_context.fig, "_underlying_overlay", plot_context.underlying_overlay)
+    _remember_control(plot_context.fig, "_secondary_overlay", plot_context.secondary_overlay)
+    _set_plot_title(plot_context.ax, f"{plot_context.title_prefix} · {field_spec.label}")
+    plot_context.ax.set_xlabel(_plot_mode_xlabel(plot_context.visibility.mode))
+    _set_field_axis_direction(plot_context.ax, field_spec.label)
+    plot_context.ax.set_ylabel(_field_ylabel(field_spec.label))
+    plot_context.ax.grid(True, alpha=0.3)
+    if plot_context.visibility.mode == HISTORICAL_PLOT_MODE:
+        plot_context.fig.autofmt_xdate()
+    _refresh_visibility(
+        plot_context.fig,
+        plot_context.ax,
+        plot_context.plotted_series,
+        plot_context.visibility,
+        plot_context.underlying_overlay,
+        plot_context.secondary_overlay,
+    )
+
+
 def _resolve_initial_maturity(quotes: pd.DataFrame, requested: str | None) -> str:
     maturity = requested
     if maturity is None:
@@ -1168,7 +1674,15 @@ def _title_prefix(quotes: pd.DataFrame, maturity: str, strike: float | None) -> 
         base = f"Strike {strike}"
     else:
         base = "All strikes"
-    return f"{quotes['underlying'].iloc[0]} · {base}"
+
+    underlying_title = str(quotes["underlying"].iloc[0])
+    latest_underlying_price = _last_underlying_price(quotes)
+    if latest_underlying_price is not None:
+        underlying_title = (
+            f"{underlying_title} @ {_format_display_value(latest_underlying_price)}"
+        )
+
+    return f"{underlying_title} · {base}"
 
 
 def main() -> int:
@@ -1232,66 +1746,87 @@ def main() -> int:
     slider = None
     maturity_toggle = None
     field_toggle = None
-    underlying_overlay = None
+    mode_toggle = None
     maturities = available_maturities(filtered_quotes)
-    plotted_series = build_plot_series(ax, filtered_quotes, field_spec.key)
-    visibility = PlotVisibility(visible_maturities={maturity})
+    maturity_colors = _build_maturity_color_map(maturities)
+    visibility = PlotVisibility(
+        visible_maturities={maturity},
+        mode=LATEST_PLOT_MODE,
+    )
     if args.strike is None:
         visibility.strike_bounds = _default_strike_range_bounds(filtered_quotes)
-    _refresh_visibility(fig, ax, plotted_series, visibility)
-    underlying_overlay = add_underlying_overlay(ax, plotted_series)
-    if underlying_overlay is not None:
-        _remember_control(fig, "_underlying_overlay", underlying_overlay)
-    control_panel_plot_right = (
-        CONTROL_PANEL_PLOT_RIGHT_WITH_OVERLAY
-        if underlying_overlay is not None
-        else CONTROL_PANEL_PLOT_RIGHT
-    )
     title_prefix = _title_prefix(filtered_quotes, maturity, args.strike)
-    ax.set_title(f"{title_prefix} · {field_spec.label}")
-
-    ax.set_xlabel("Quote date")
-    _set_field_axis_direction(ax, field_spec.label)
-    ax.set_ylabel(_field_ylabel(field_spec.label))
-    ax.grid(True, alpha=0.3)
-    fig.autofmt_xdate()
+    control_panel_plot_right = _plot_right_for_quotes(filtered_quotes, field)
+    plot_context = PlotContext(
+        fig=fig,
+        ax=ax,
+        quotes=filtered_quotes,
+        latest_quotes=filter_to_latest_timestamp(filtered_quotes),
+        title_prefix=title_prefix,
+        field=field,
+        visibility=visibility,
+        maturities=maturities,
+        maturity_colors=maturity_colors,
+        plot_right=control_panel_plot_right,
+        plotted_series=[],
+    )
+    _rebuild_plot_context(plot_context)
     fig.tight_layout()
-    _ensure_leftmost_xtick_visible(fig, ax)
+    fig.subplots_adjust(right=control_panel_plot_right)
     if visibility is not None:
         if filtered_quotes["strikePrice"].dropna().nunique() > 1:
             slider = add_strike_range_slider(
                 fig,
                 ax,
-                plotted_series,
+                plot_context.plotted_series,
                 visibility,
-                underlying_overlay,
+                plot_context.underlying_overlay,
                 reference_price=_last_underlying_price(filtered_quotes),
                 plot_right=control_panel_plot_right,
+                plot_context=plot_context,
             )
             if slider is not None:
                 _remember_control(fig, "_strike_range_slider", slider)
         maturity_toggle = add_maturity_toggle(
             fig,
             ax,
-            plotted_series,
+            plot_context.plotted_series,
             maturities,
             visibility,
-            underlying_overlay,
+            plot_context.underlying_overlay,
             plot_right=control_panel_plot_right,
+            maturity_colors=maturity_colors,
+            plot_context=plot_context,
         )
         if maturity_toggle is not None:
             _remember_control(fig, "_maturity_toggle", maturity_toggle)
     field_toggle = add_field_toggle(
         fig,
         ax,
-        plotted_series,
+        plot_context.plotted_series,
         field_options,
         field,
         title_prefix,
         plot_right=control_panel_plot_right,
+        plot_context=plot_context,
     )
     if field_toggle is not None:
         _remember_control(fig, "_field_toggle", field_toggle)
+    mode_toggle = add_mode_toggle(
+        fig,
+        ax,
+        visibility,
+        plot_context=plot_context,
+    )
+    _remember_control(fig, "_mode_toggle", mode_toggle)
+    _refresh_visibility(
+        fig,
+        ax,
+        plot_context.plotted_series,
+        visibility,
+        plot_context.underlying_overlay,
+        plot_context.secondary_overlay,
+    )
     plt.show()
     return 0
 
