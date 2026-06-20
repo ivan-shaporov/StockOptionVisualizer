@@ -9,6 +9,31 @@ import pandas as pd
 import plot_option_prices as module
 
 
+class LoadQuotesTests(unittest.TestCase):
+    def test_load_quotes_parses_dates_and_keeps_numeric_csv_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "quotes.csv"
+            pd.DataFrame(
+                {
+                    "updated": ["2024-03-01 12:34:56"],
+                    "strikePrice": ["100.0"],
+                    "underlyingPrice": ["101.5"],
+                    "ask": ["2.25"],
+                    "mid": ["2.0"],
+                }
+            ).to_csv(csv_path, index=False)
+
+            quotes = module.load_quotes(csv_path)
+
+        self.assertTrue(pd.api.types.is_datetime64_any_dtype(quotes["updated"]))
+        self.assertTrue(pd.api.types.is_numeric_dtype(quotes["strikePrice"]))
+        self.assertTrue(pd.api.types.is_numeric_dtype(quotes["underlyingPrice"]))
+        self.assertTrue(pd.api.types.is_numeric_dtype(quotes["ask"]))
+        self.assertEqual(quotes["strikePrice"].tolist(), [100.0])
+        self.assertEqual(quotes["underlyingPrice"].tolist(), [101.5])
+        self.assertEqual(quotes["ask"].tolist(), [2.25])
+
+
 class ResolveFieldTests(unittest.TestCase):
     def test_resolve_field_accepts_loss(self) -> None:
         with patch.dict(module.os.environ, {"PLOT_FIELD": "loss"}, clear=True):
@@ -45,6 +70,23 @@ class EnrichQuotesTests(unittest.TestCase):
         self.assertAlmostEqual(cast(float, prepared.loc[0, "loss"]), 12.0)
         self.assertAlmostEqual(cast(float, prepared.loc[1, "loss"]), 81.0)
         self.assertEqual(module.available_plot_fields(prepared), ("ask", "loss"))
+
+    def test_enrich_quotes_expects_numeric_columns_for_direct_dataframe_inputs(self) -> None:
+        quotes = pd.DataFrame(
+            {
+                "optionSymbol": ["AAPL240621P00090000"],
+                "underlyingPrice": [100.0],
+                "strikePrice": [90.0],
+                "ask": [2.0],
+            }
+        )
+
+        prepared = module.enrich_quotes(quotes)
+
+        self.assertTrue(pd.api.types.is_numeric_dtype(prepared["underlyingPrice"]))
+        self.assertTrue(pd.api.types.is_numeric_dtype(prepared["strikePrice"]))
+        self.assertTrue(pd.api.types.is_numeric_dtype(prepared["ask"]))
+        self.assertAlmostEqual(cast(float, prepared.loc[0, "loss"]), 12.0)
 
     def test_enrich_quotes_skips_loss_when_input_does_not_support_it(self) -> None:
         quotes = pd.DataFrame(
@@ -494,6 +536,31 @@ class StrikeRangeSliderTests(unittest.TestCase):
         self.assertIs(slider, fake_slider)
         self.assertEqual(visibility.strike_bounds, (85.0, 90.0))
         self.assertEqual(slider_cls.call_args.kwargs["valinit"], (85.0, 90.0))
+
+    def test_visible_quotes_for_series_filters_numeric_strikes(self) -> None:
+        quotes = pd.DataFrame(
+            {
+                "updated": pd.to_datetime(["2024-03-01", "2024-03-02"]),
+                "strikePrice": [100.0, 105.0],
+                "mid": [1.0, 1.2],
+            }
+        )
+
+        visible_quotes = module._visible_quotes_for_series(
+            module.PlotSeries(
+                MagicMock(),
+                quotes,
+                "2024-03-15",
+                100.0,
+                field="mid",
+            ),
+            module.PlotVisibility(
+                visible_maturities={"2024-03-15"},
+                strike_bounds=(105.0, 105.0),
+            ),
+        )
+
+        self.assertEqual(visible_quotes["strikePrice"].tolist(), [105.0])
 
 
 class XTickLabelAlignmentTests(unittest.TestCase):

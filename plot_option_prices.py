@@ -227,9 +227,9 @@ def _compute_loss_field(
     crash_price_fraction: float = CRASH_PRICE_FRACTION,
     field_label: str = LOSS_FIELD,
 ) -> pd.Series:
-    underlying = pd.to_numeric(quotes["underlyingPrice"], errors="coerce")
-    strike = pd.to_numeric(quotes["strikePrice"], errors="coerce")
-    ask = pd.to_numeric(quotes["ask"], errors="coerce")
+    underlying = quotes["underlyingPrice"]
+    strike = quotes["strikePrice"]
+    ask = quotes["ask"]
 
     if underlying.dropna().le(0).any():
         raise SystemExit(
@@ -251,7 +251,7 @@ def _loss_field_error(quotes: pd.DataFrame, field_label: str = LOSS_FIELD) -> st
     if not symbols.empty and not symbols.str[-9].eq("P").all():
         return f"error: PLOT_FIELD={field_label!r} is only supported for put option data"
 
-    underlying = pd.to_numeric(quotes["underlyingPrice"], errors="coerce")
+    underlying = quotes["underlyingPrice"]
     if underlying.dropna().le(0).any():
         return f"error: PLOT_FIELD={field_label!r} requires positive underlyingPrice values"
 
@@ -506,10 +506,6 @@ def _last_underlying_price(quotes: pd.DataFrame) -> float | None:
         return None
 
     underlying_quotes = quotes.loc[:, ["updated", UNDERLYING_PRICE_FIELD]].copy()
-    underlying_quotes[UNDERLYING_PRICE_FIELD] = pd.to_numeric(
-        underlying_quotes[UNDERLYING_PRICE_FIELD],
-        errors="coerce",
-    )
     underlying_quotes = underlying_quotes.dropna(subset=["updated", UNDERLYING_PRICE_FIELD])
     if underlying_quotes.empty:
         return None
@@ -793,7 +789,7 @@ def _visible_quotes_for_series(
         return visible_quotes
 
     lower, upper = sorted(visibility.strike_bounds)
-    strike_values = pd.to_numeric(visible_quotes["strikePrice"], errors="coerce")
+    strike_values = visible_quotes["strikePrice"]
     return visible_quotes.loc[strike_values.between(lower, upper)]
 
 
@@ -825,10 +821,6 @@ def _visible_underlying_price_summary(
         )
 
     combined = pd.concat(visible_quotes, ignore_index=True)
-    combined[UNDERLYING_PRICE_FIELD] = pd.to_numeric(
-        combined[UNDERLYING_PRICE_FIELD],
-        errors="coerce",
-    )
     combined = combined.dropna(subset=["updated", UNDERLYING_PRICE_FIELD])
     if combined.empty:
         return pd.DataFrame(
